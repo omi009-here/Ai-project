@@ -19,12 +19,31 @@ CAM_WIDTH     = 640
 CAM_HEIGHT    = 480
 
 # ── Stability pipeline ───────────────────────────────────────
-RATIO_MIN     = 0.15    # fully pinched  -> 0%
-RATIO_MAX     = 0.50    # fully spread   -> 100%
-SMOOTH_FACTOR = 0.018   # ultra-gentle exponential glide
+# These start as sane defaults based on real hand proportions, then
+# AUTO-WIDEN during use to fit your specific hand/camera distance (see
+# auto_ratio_min/auto_ratio_max in main()). They only ever expand, never
+# shrink, so this can only get more accurate over time, never worse.
+# (Old values of 0.15/0.50 were the bug: a relaxed, comfortable spread
+# produces a ratio around 0.9-1.0 for most adult hands, so the volume
+# clipped to 100% almost immediately and you only ever saw 0 or 100.)
+RATIO_MIN_DEFAULT = 0.12    # fully pinched  -> 0%
+RATIO_MAX_DEFAULT = 0.85    # fully spread   -> 100%
+RATIO_ABS_MIN      = 0.04   # auto-min can never go below this (false-detection guard)
+RATIO_ABS_MAX      = 1.60   # auto-max can never go above this (false-detection guard)
+DEPTH_SMOOTH_FACTOR = 0.18   # how fast the hand-size (depth) reference is
+                             # allowed to change — lower = ignores forward/
+                             # back jitter more, but reacts slower to a
+                             # genuine "I moved closer to the camera"
+SMOOTH_FACTOR = 0.12    # exponential glide: lower = steadier, calmer
+                         # volume movement. Raise toward 0.2-0.25 only
+                         # if it starts feeling laggy/sluggish; this
+                         # value favours a smooth, controlled rise/fall
+                         # over an instant snap to the hand position
 DEAD_ZONE     = 0.5     # % threshold before system volume moves
-HISTORY_LEN   = 14      # rolling median window (larger = more stable)
-MEDIAN_LEN    = 7       # inner median for spike removal
+HISTORY_LEN   = 6        # rolling median window — longer = steadier,
+                          # averages more recent frames before the value
+                          # is even handed to the glide stage
+MEDIAN_LEN    = 5        # inner median for spike removal
 
 # ── Colours ─────────────────────────────────────────────────
 C_YELLOW  = (0,   255, 255)
@@ -48,26 +67,65 @@ HAND_CONNECTIONS = [
 # AUDIO
 # ─────────────────────────────────────────────
 def init_audio():
-    from pycaw.pycaw import AudioUtilities
-    device = AudioUtilities.GetSpeakers()
+    # pycaw needs the COM apartment initialized on this thread before any
+    # Activate()/EndpointVolume call - missing this is the #1 cause of
+    # 'AudioDevice object has no attribute Activate' / EndpointVolume failures.
     try:
-        volume = device.EndpointVolume
-        r = volume.GetVolumeRange()
-        print(f"[INFO] Audio ready. dB range: {r[0]:.1f} to {r[1]:.1f}")
-        return volume, r[0], r[1]
-    except Exception:
-        pass
+        import pythoncom
+        pythoncom.CoInitialize()
+    except Exception as e:
+        print(f"[WARNING] pythoncom.CoInitialize failed ({e}) - "
+              f"if audio still fails below, run: pip install pywin32")
+
+    from ctypes import cast, POINTER
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+
+    last_err = None
+
+    # Path A (current pycaw): GetSpeakers() returns an AudioDevice wrapper
+    # that exposes .Activate() directly.
     try:
-        from ctypes import cast, POINTER
-        from comtypes import CLSCTX_ALL
-        from pycaw.pycaw import IAudioEndpointVolume
+        device = AudioUtilities.GetSpeakers()
         iface  = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
         volume = cast(iface, POINTER(IAudioEndpointVolume))
         r = volume.GetVolumeRange()
-        print(f"[INFO] Audio ready (legacy). dB range: {r[0]:.1f} to {r[1]:.1f}")
+        print(f"[INFO] Audio ready (Activate). dB range: {r[0]:.1f} to {r[1]:.1f}")
         return volume, r[0], r[1]
     except Exception as e:
-        raise RuntimeError(f"Both pycaw APIs failed: {e}")
+        last_err = e
+
+    # Path B (older pycaw): GetSpeakers() returns an object that already
+    # exposes a high-level .EndpointVolume property.
+    try:
+        device = AudioUtilities.GetSpeakers()
+        volume = device.EndpointVolume
+        r = volume.GetVolumeRange()
+        print(f"[INFO] Audio ready (EndpointVolume). dB range: {r[0]:.1f} to {r[1]:.1f}")
+        return volume, r[0], r[1]
+    except Exception as e:
+        last_err = e
+
+    # Path C: pull the raw COM device directly, in case
+    # AudioUtilities.GetSpeakers() itself is returning the wrong wrapper type.
+    try:
+        devices = AudioUtilities.GetAllDevices()
+        spk = next(d for d in devices if d.state == 1)  # DEVICE_STATE.ACTIVE
+        iface  = spk._dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        volume = cast(iface, POINTER(IAudioEndpointVolume))
+        r = volume.GetVolumeRange()
+        print(f"[INFO] Audio ready (raw device). dB range: {r[0]:.1f} to {r[1]:.1f}")
+        return volume, r[0], r[1]
+    except Exception as e:
+        last_err = e
+
+    raise RuntimeError(
+        f"All pycaw init paths failed: {last_err}\n"
+        f"  Fix checklist:\n"
+        f"  1. pip uninstall pycaw -y && pip install pycaw --upgrade\n"
+        f"  2. pip install pywin32  (then run: python <venv>/Scripts/pywin32_postinstall.py -install, as admin)\n"
+        f"  3. Run the terminal/VS Code as Administrator once to test"
+    )
 
 # ─────────────────────────────────────────────
 # MEDIAPIPE
@@ -110,20 +168,67 @@ def init_solutions_api():
 def dist_px(p1, p2):
     return math.hypot(p2[0]-p1[0], p2[1]-p1[1])
 
-def get_ratio(lms_px):
+def get_hand_size(lms_px):
+    """
+    Robust scale reference for the hand, used to normalise the pinch
+    distance against distance-from-camera (forward/back movement).
+
+    A single bone (wrist -> middle MCP) is short and noisy: any small
+    landmark jitter on either point swings the ratio a lot, and that
+    noise gets *worse* the farther the hand is from the camera (fewer
+    pixels -> more relative jitter). Averaging several independent
+    bone spans across the palm cancels out per-landmark jitter and
+    gives a much steadier "how big is this hand right now" number.
+    """
+    spans = (
+        dist_px(lms_px[0], lms_px[5]),    # wrist -> index MCP
+        dist_px(lms_px[0], lms_px[9]),    # wrist -> middle MCP
+        dist_px(lms_px[0], lms_px[17]),   # wrist -> pinky MCP
+        dist_px(lms_px[5], lms_px[17]),   # index MCP -> pinky MCP (palm width)
+    )
+    return max(sum(spans) / len(spans), 1.0)
+
+def get_ratio(lms_px, hsize):
     pinch = dist_px(lms_px[4], lms_px[8])
-    hsize = max(dist_px(lms_px[0], lms_px[9]), 1.0)
     return pinch / hsize, lms_px[4], lms_px[8]
 
 # ─────────────────────────────────────────────
 # SMOOTHING PIPELINE
 # ─────────────────────────────────────────────
+class DepthSmoother:
+    """
+    Smooths the hand-size (depth) reference on its own, *before* it's
+    used to divide the pinch distance into a ratio.
+
+    This is the key fix for the "moving hand forward/back makes the
+    volume drift" issue: previously the noisy raw hand-size was used
+    immediately every frame, so any depth jitter went straight into
+    the ratio and then had to be smoothed out *after the fact* (which
+    just adds lag instead of fixing the cause). Filtering hand-size
+    first means depth changes never reach the ratio calculation as
+    noise in the first place — only as a genuine, slow scale change,
+    which cancels out correctly.
+    """
+    def __init__(self):
+        self.value = None
+
+    def update(self, raw_size):
+        if self.value is None:
+            self.value = raw_size
+        else:
+            self.value += DEPTH_SMOOTH_FACTOR * (raw_size - self.value)
+        return self.value
+
+
 class VolumeSmoother:
     """
     3-stage pipeline:
       1. Median filter  — removes spike noise (outlier frames)
       2. Rolling mean   — averages out natural hand tremor
-      3. Exponential    — creates the buttery glide to system volume
+      3. Exponential    — creates the glide to system volume, tuned
+                           to track the hand closely (fast sync) now
+                           that the input ratio itself is already
+                           clean thanks to DepthSmoother.
     """
     def __init__(self):
         self.median_buf  = deque(maxlen=MEDIAN_LEN)
@@ -224,7 +329,7 @@ def draw_volume_panel(frame, sv):
     cv2.putText(frame, "VOL", (PX+24, PY+18),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, C_WHITE, 1)
 
-def draw_hud(frame, sv, fps, ratio, audio_ok, api):
+def draw_hud(frame, sv, fps, ratio, audio_ok, api, r_min, r_max):
     # HUD background
     roi  = frame[0:140, 0:230]
     dark = cv2.addWeighted(cv2.GaussianBlur(roi,(0,0),8),0.3,
@@ -234,7 +339,8 @@ def draw_hud(frame, sv, fps, ratio, audio_ok, api):
     ac = (70,210,70) if audio_ok else (50,50,240)
     cv2.putText(frame, f"FPS   {fps:5.1f}",        (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.52, C_WHITE,       1)
     cv2.putText(frame, f"VOL   {int(round(sv))}%", (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.70, C_WHITE,       2)
-    cv2.putText(frame, f"Ratio {ratio:.3f}",        (10, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (155,155,155), 1)
+    cv2.putText(frame, f"Ratio {ratio:.3f}  [{r_min:.2f}-{r_max:.2f}]",
+                                                    (10, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (155,155,155), 1)
     cv2.putText(frame, "Audio ON" if audio_ok else "Audio OFF",
                                                     (10, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.42, ac,            1)
     cv2.putText(frame, f"API: {api}",               (10,118), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (90,90,90),    1)
@@ -244,7 +350,7 @@ def draw_hud(frame, sv, fps, ratio, audio_ok, api):
     dark2 = cv2.addWeighted(cv2.GaussianBlur(roi2,(0,0),8),0.3,
                             np.full_like(roi2,20),0.7, 0)
     frame[CAM_HEIGHT-38:CAM_HEIGHT, 0:CAM_WIDTH] = dark2
-    cv2.putText(frame, "PINCH = mute    SPREAD = max vol    Q = quit",
+    cv2.putText(frame, "Thumb-Index distance sets volume    Q = quit",
                 (55, CAM_HEIGHT-12), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (170,170,170), 1)
 
 # ─────────────────────────────────────────────
@@ -259,17 +365,35 @@ def main():
     except Exception as e:
         print(f"[WARNING] Audio unavailable: {e}")
 
-    # Camera
+    # Camera — try the configured index first, then auto-fallback through
+    # other common indices. CAM_INDEX=2 alone was a frequent hard-crash
+    # point on machines where the webcam isn't at index 2.
+    def try_open(idx):
+        c = cv2.VideoCapture(idx, CAM_BACKEND)
+        c.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_WIDTH)
+        c.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+        c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        for _ in range(12):
+            c.read()
+        ok, t = c.read()
+        if ok and t is not None and t.size > 0:
+            return c
+        c.release()
+        return None
+
     print(f"[INFO] Opening camera index={CAM_INDEX}...")
-    cap = cv2.VideoCapture(CAM_INDEX, CAM_BACKEND)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    for _ in range(12):
-        cap.read()
-    ret, test = cap.read()
-    if not ret or test is None or test.size == 0:
-        print("[ERROR] Camera not responding. Try changing CAM_INDEX.")
+    cap = try_open(CAM_INDEX)
+    if cap is None:
+        print(f"[WARNING] Camera index={CAM_INDEX} not responding, trying others...")
+        for idx in [i for i in range(4) if i != CAM_INDEX]:
+            print(f"[INFO] Trying camera index={idx}...")
+            cap = try_open(idx)
+            if cap is not None:
+                print(f"[INFO] Camera found at index={idx}.")
+                break
+    if cap is None:
+        print("[ERROR] No working camera found on indices 0-3. "
+              "Check that a webcam is connected and not in use by another app.")
         sys.exit(1)
     print(f"[INFO] Camera ready: {int(cap.get(3))}x{int(cap.get(4))}")
 
@@ -295,7 +419,10 @@ def main():
             cap.release()
             sys.exit(1)
 
-    smoother  = VolumeSmoother()
+    smoother      = VolumeSmoother()
+    depth_smoother = DepthSmoother()
+    auto_ratio_min = RATIO_MIN_DEFAULT
+    auto_ratio_max = RATIO_MAX_DEFAULT
     prev_time = time.time()
     ratio     = 0.0
     frame_ts  = 0
@@ -325,7 +452,8 @@ def main():
                 for hlms in results.multi_hand_landmarks:
                     mp_draw.draw_landmarks(frame, hlms, mp_hands.HAND_CONNECTIONS, sl, sc)
                     lms_px = [(int(lm.x*CAM_WIDTH), int(lm.y*CAM_HEIGHT)) for lm in hlms.landmark]
-                    ratio, thumb, index = get_ratio(lms_px)
+                    hsize  = depth_smoother.update(get_hand_size(lms_px))
+                    ratio, thumb, index = get_ratio(lms_px, hsize)
                     draw_pinch(frame, thumb, index)
         else:
             frame_ts += 33
@@ -337,12 +465,22 @@ def main():
                 for hand in result.hand_landmarks:
                     lms_px = [(int(lm.x*CAM_WIDTH), int(lm.y*CAM_HEIGHT)) for lm in hand]
                     draw_landmarks_manual(frame, lms_px)
-                    ratio, thumb, index = get_ratio(lms_px)
+                    hsize  = depth_smoother.update(get_hand_size(lms_px))
+                    ratio, thumb, index = get_ratio(lms_px, hsize)
                     draw_pinch(frame, thumb, index)
 
         # ── 3-stage smoothing ────────────────
         if hand_found:
-            raw = float(np.clip(np.interp(ratio, [RATIO_MIN, RATIO_MAX], [0, 100]), 0, 100))
+            # Self-widening calibration: if you pinch tighter or spread wider
+            # than what we've seen so far, stretch the bounds to fit it.
+            # Sanity-clamped so a bad detection frame can't blow the range out.
+            if RATIO_ABS_MIN < ratio < auto_ratio_min:
+                auto_ratio_min = ratio
+            if RATIO_ABS_MAX > ratio > auto_ratio_max:
+                auto_ratio_max = ratio
+
+            raw = float(np.clip(
+                np.interp(ratio, [auto_ratio_min, auto_ratio_max], [0, 100]), 0, 100))
             sv  = smoother.update(raw)
         else:
             sv  = smoother.smooth   # freeze while no hand
@@ -363,7 +501,7 @@ def main():
         prev_time = now
 
         draw_volume_panel(frame, sv)
-        draw_hud(frame, sv, fps, ratio, audio_ok, api_name)
+        draw_hud(frame, sv, fps, ratio, audio_ok, api_name, auto_ratio_min, auto_ratio_max)
 
         cv2.imshow("Hand Volume Control  |  Q = quit", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
